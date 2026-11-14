@@ -1,0 +1,416 @@
+import { PROJECTION_VERSION } from './history.js'
+import { jsonBytes } from './json-size.js'
+import { randomUUID } from 'node:crypto'
+import { parseAttachments } from './attachments.js'
+import type { SessionId } from '@deepseek-ai/dsh-session'
+import type { SessionQueryEngine, SessionRecord } from '@deepseek-ai/dsh-session-query'
+import { capabilities } from './capabilities.js'
+import { BridgeError, CreationNotStartedError, publicError } from './errors.js'
+import { parseSelections } from './selections.js'
+import { projectHistoryAsync } from './history.js'
+import { sessionId, nativeSessionId } from './identity.js'
+import type { NativeRuntime } from './native.js'
+import { lastTurnEndKind } from './native.js'
+import { SyncFeed, type SyncTransport } from './sync.js'
+import { CONTINUE_ACTION, turnOutcomeNotice } from './turn-outcome.js'
+import type { TimelineItem } from './types.js'
+
+export interface SessionReader {
+  native?: NativeRuntime
+  query: Pick<SessionQueryEngine, 'listSessions' | 'readSession' | 'readTitleSnapshots'>
+  status(id: SessionId): 'idle' | 'running' | undefined
+}
+interface Page<T> { id: string, values: T[], expires: number, timer?: ReturnType<typeof setTimeout> }
+interface HistoryPage extends Page<TimelineItem> {
+  externalId: string
+  platformId: string
+  watermark: { seq: number, revision: string }
+  truncated: boolean
+}
+export const PAGE_LIFETIME = 120_000
+
+function integer(value: unknown, fallback: number, max: number): number {
+  if (value === undefined || value === null) return fallback
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 1 || value > max) {
+    throw new BridgeError('INVALID_PARAMS', `The limit must be an integer between 1 and ${max}.`)
+  }
+  return value
+}
+
+/** Per-namespace cursors are temporary captures, not a second persisted session store. */
+export class RuntimeRouter {
+  private feed: SyncFeed | undefined
+  private inventory: Page<SessionRecord> | undefined
+  private history: HistoryPage | undefined
+
+  constructor(
+    private readonly reader: SessionReader,
+    readonly namespace: string,
+    private readonly pageLifetimeMs = PAGE_LIFETIME,
+  ) {}
+
+  private readonly closing = new AbortController()
+  /** Aborted once this router is torn down; open sync streams end with it. */
+  get closed(): AbortSignal { return this.closing.signal }
+  get hasInventoryPage(): boolean { return this.inventory !== undefined }
+  get hasHistoryPage(): boolean { return this.history !== undefined }
+
+  /** End the event feed. Paged reads belong to RPC callers, so a resubscription keeps their cursors. */
+  close(): void {
+    this.feed?.close()
+    this.feed = undefined
+  }
+
+  private clearInventory(): void {
+    if (!this.inventory) return
+    if (this.inventory.timer) clearTimeout(this.inventory.timer)
+    this.inventory = undefined
+  }
+
+  private clearHistory(): void {
+    if (!this.history) return
+    if (this.history.timer) clearTimeout(this.history.timer)
+    this.history = undefined
+  }
+
+  private retainInventory(page: Page<SessionRecord>): void {
+    if (page.timer) clearTimeout(page.timer)
+    page.expires = Date.now() + this.pageLifetimeMs
+    page.timer = setTimeout(() => {
+      if (this.inventory === page) this.clearInventory()
+    }, this.pageLifetimeMs)
+    page.timer.unref?.()
+    this.inventory = page
+  }
+
+  private retainHistory(page: HistoryPage): void {
+    if (page.timer) clearTimeout(page.timer)
+    page.expires = Date.now() + this.pageLifetimeMs
+    page.timer = setTimeout(() => {
+      if (this.history === page) this.clearHistory()
+    }, this.pageLifetimeMs)
+    page.timer.unref?.()
+    this.history = page
+  }
+
+  /** Stop this namespace for good: open streams end instead of waiting for drain. */
+  shutdown(): void {
+    this.close()
+    this.clearInventory()
+    this.clearHistory()
+    this.closing.abort()
+  }
+
+  /** Replace this namespace's event feed; `failed` reports why a running feed stopped. */
+  subscribe(subscriptionId: string, durableCheckpoints: boolean, transport: SyncTransport,
+    failed: (error: unknown) => void): SyncFeed {
+    if (!this.reader.native) throw new BridgeError('UNSUPPORTED_OPERATION', 'Event sync is unavailable.')
+    this.close()
+    const feed = new SyncFeed(this.reader.native, this.namespace, subscriptionId, transport, error => {
+      if (this.feed !== feed) return
+      this.feed = undefined
+      failed(error)
+    }, durableCheckpoints)
+    this.feed = feed
+    return feed
+  }
+
+  unsubscribe(feed: SyncFeed): void { if (this.feed === feed) this.close() }
+
+  async request(method: string, params: Record<string, unknown>, signal: AbortSignal): Promise<unknown> {
+    signal.throwIfAborted()
+    switch (method) {
+      case 'getPlanning':
+      case 'setPlanning': {
+        const native = this.reader.native
+        if (!native) return { available: false }
+        if (method === 'getPlanning' && !params.externalSessionId && !params.sessionId) return { available: Boolean(native.planning.service()) }
+        const id = await this.resolve(params, signal)
+        if (method === 'getPlanning') return native.planning.read(id)
+        if (typeof params.active !== 'boolean') throw new BridgeError('INVALID_PARAMS', 'A planning mode is required.')
+        return native.planning.set(id, params.active)
+      }
+      case 'refreshSync': {
+        // Unreadable sessions must remain addressable for an explicit retry.
+        const id = await this.resolve(params, signal, true)
+        if (!this.reader.native) throw new BridgeError('UNSUPPORTED_OPERATION', 'Event sync is unavailable.')
+        this.reader.native.refresh(id)
+        return { accepted: true }
+      }
+      case 'createAndStartSession':
+      case 'startTurn': {
+        const native = this.reader.native
+        if (!native) throw new BridgeError('UNSUPPORTED_OPERATION', 'Text messaging is unavailable.')
+        const attachments = parseAttachments(params.attachments)
+        if (typeof params.sessionId !== 'string' || !params.sessionId || typeof params.content !== 'string' || typeof params.clientMessageId !== 'string') throw new BridgeError('INVALID_PARAMS', 'Session ID, text and clientMessageId are required.')
+        const create = method === 'createAndStartSession'
+        const id = create ? nativeSessionId(this.namespace, params.sessionId) as SessionId : await this.resolve(params, signal, true)
+        try {
+          await native.send(id, params.content, params.clientMessageId, typeof params.cwd === 'string' ? params.cwd : undefined, create,
+            parseSelections(params.selections), typeof params.agentPreset === 'string' ? params.agentPreset : undefined, signal, attachments, params.sessionId, params.planningIntent === true)
+        } catch (error) {
+          const failure = publicError(error)
+          const sourceState = await native.source.state(id)
+          const configuration = native.ctx.sessions.get(id) ? await native.configuration.state(id).catch(() => undefined) : undefined
+          return { ok: false, code: failure.code === 'SESSION_ARCHIVED' ? 'session_archived' : failure.code === 'SESSION_NOT_FOUND' ? 'session_unavailable' : failure.code,
+            message: failure.message, result: { sessionId: params.sessionId, externalSessionId: id, sourceState,
+              ...(error instanceof CreationNotStartedError ? { created: false, messageAccepted: false }
+                : configuration ? { configuration, created: create } : {}) } }
+        }
+        return { accepted: true, sessionId: sessionId(this.namespace, id), externalSessionId: id }
+      }
+      case 'listModels': {
+        if (!this.reader.native) throw new BridgeError('UNSUPPORTED_OPERATION', 'Model catalog is unavailable.')
+        const catalog = await this.reader.native.catalogs.models(true)
+        const query = typeof params.query === 'string' ? params.query.toLocaleLowerCase() : ''
+        return { ...catalog, models: catalog.models.filter(item => `${item.title} ${item.metadata.providerName} ${item.metadata.model}`.toLocaleLowerCase().includes(query))
+          .slice(0, integer(params.limit, 1000, 10_000)) }
+      }
+      case 'listPermissions': {
+        if (!this.reader.native) throw new BridgeError('UNSUPPORTED_OPERATION', 'Permission catalog is unavailable.')
+        return this.reader.native.catalogs.permissions()
+      }
+      case 'listAgentPresets': {
+        if (!this.reader.native) throw new BridgeError('UNSUPPORTED_OPERATION', 'Agent modes are unavailable.')
+        return this.reader.native.catalogs.agentPresets()
+      }
+      case 'updateSelections': {
+        const native = this.reader.native
+        if (!native) throw new BridgeError('UNSUPPORTED_OPERATION', 'Configuration changes are unavailable.')
+        const id = await this.resolve(params, signal)
+        const selections = parseSelections(params.selections)
+        if (!Object.keys(selections).length) throw new BridgeError('INVALID_PARAMS', 'Choose a configuration to change.')
+        try { await native.updateSelections(id, selections, signal) }
+        catch (error) {
+          const failure = publicError(error)
+          return { ok: false, code: failure.code, message: failure.message,
+            result: { state: await this.request('getSessionState', params, new AbortController().signal).catch(() => null) } }
+        }
+        return { ok: true, result: { state: await this.request('getSessionState', params, signal) } }
+      }
+      case 'interruptSession': {
+        if (!this.reader.native) throw new BridgeError('UNSUPPORTED_OPERATION', 'Interrupt is unavailable.')
+        const id = await this.resolve(params, signal)
+        await this.reader.native.interrupt(id)
+        return { accepted: true, sessionId: sessionId(this.namespace, id), externalSessionId: id }
+      }
+      case 'ping': return { ok: true }
+      case 'getRuntimeConfig': return { runtime: 'dsh', revision: 2, values: {}, metadata: { readOnly: !this.reader.native?.ctx.get('agents'), storageMode: 'dsh-native' } }
+      case 'listWorkspaces': return { workspaces: this.reader.native?.workspaces() ?? [] }
+      case 'getRuntimeCapabilities': return this.reader.native?.capabilities() ?? capabilities()
+      case 'listSessions': return this.list(params, signal)
+      case 'getSessionSnapshot': return this.snapshot(params, signal)
+      case 'getSessionState': {
+        const id = await this.resolve(params, signal, true)
+        const native = this.reader.native
+        if (!native) {
+          // A carrier without a Host answers from the query reader alone.
+          const log = await this.reader.query.readSession(id)
+          const liveStatus = this.reader.status(id)
+          return { runtime: 'dsh', sessionId: sessionId(this.namespace, id), externalSessionId: id,
+            status: liveStatus ?? (lastTurnEndKind(log.events) === 'error' ? 'error' : 'idle'), selections: {},
+            metadata: { readOnly: true, attached: liveStatus !== undefined } }
+        }
+        // Only an unknown identity pays for a corpus listing; a known one is
+        // answered from the observed records.
+        await native.ensureKnown(id, signal)
+        const sourceState = await native.source.state(id)
+        if (sourceState.availability !== 'available') return {
+          runtime: 'dsh', sessionId: sessionId(this.namespace, id), externalSessionId: id,
+          status: 'blocked', selections: {}, sourceState, metadata: { readOnly: true, attached: false },
+        }
+        const facts = await native.stateFacts(id)
+        signal.throwIfAborted()
+        const liveStatus = this.reader.status(id)
+        return { runtime: 'dsh', sessionId: sessionId(this.namespace, id), externalSessionId: id, sourceState,
+          status: native.questions.waiting(id) || native.approvals.waiting(id) ? 'waiting_approval' : liveStatus ?? (facts.lastTurnEndKind === 'error' ? 'error' : 'idle'),
+          selections: facts.configuration.selections,
+          metadata: { ...facts.configuration.metadata, readOnly: !native.ctx.get('sessionController'), attached: liveStatus !== undefined } }
+      }
+      case 'getSessionNotices': {
+        const id = await this.resolve(params, signal)
+        const native = this.reader.native
+        return { notices: [...(native?.questions.notices(this.namespace, id) ?? []), ...(native?.approvals.notices(this.namespace, id) ?? []),
+          ...(native ? await this.turnOutcomeNotices(native, id) : [])] }
+      }
+      case 'respondInteraction': {
+        const id = await this.resolve(params, signal)
+        if (!this.reader.native || typeof params.noticeId !== 'string' || typeof params.actionId !== 'string') throw new BridgeError('INVALID_PARAMS', 'A question and action are required.')
+        if (this.reader.native.approvals.owns(this.namespace, id, params.noticeId)) return this.reader.native.approvals.respond(this.namespace, id, params.noticeId, params.actionId)
+        if (params.actionId === CONTINUE_ACTION) return this.reader.native.continueTurn(this.namespace, id, params.noticeId, signal)
+        return this.reader.native.questions.respond(this.namespace, id, params.noticeId, params.actionId, params.inputData)
+      }
+      case 'getSessionCapabilities': {
+        const id = await this.resolve(params, signal, true)
+        await this.reader.native?.ensureKnown(id, signal)
+        return this.reader.native?.capabilities(sessionId(this.namespace, id), id) ?? capabilities(sessionId(this.namespace, id))
+      }
+      case 'listCommands':
+      case 'executeCommand': {
+        const native = this.reader.native
+        if (!native) throw new BridgeError('UNSUPPORTED_OPERATION', 'DSH native commands are unavailable.')
+        const id = await this.resolve(params, signal)
+        return method === 'listCommands' ? native.commands.list(id, params, signal) : native.commands.execute(id, params, signal)
+      }
+      default:
+        throw new BridgeError('METHOD_NOT_FOUND', 'The DSH runtime does not support this method.')
+    }
+  }
+
+  /** The open error card of the latest turn; reading it must never fail the other notices. */
+  private async turnOutcomeNotices(native: NativeRuntime, id: SessionId) {
+    try {
+      const outcome = (await native.stateFacts(id)).turnOutcome
+      if (!outcome) return []
+      const continuable = outcome.kind === 'failed' && await native.continuable(id, outcome.endSeq)
+      return [turnOutcomeNotice(this.namespace, id, { ...outcome, continuable })]
+    } catch (error) {
+      native.diagnostics.log('warn', 'session.turn_outcome_unavailable', { sessionId: id }, error)
+      return []
+    }
+  }
+
+  private async resolve(params: Record<string, unknown>, signal: AbortSignal, includeUnavailable = false): Promise<SessionId> {
+    const externalId = params.externalSessionId
+    if (typeof externalId === 'string' && externalId) {
+      if (params.sessionId !== undefined && params.sessionId !== sessionId(this.namespace, externalId)) {
+        throw new BridgeError('INVALID_PARAMS', 'The session does not belong to this runtime namespace.')
+      }
+      if (this.reader.native && !includeUnavailable) {
+        await this.reader.native.ensureKnown(externalId, signal)
+        this.reader.native.source.retry(externalId)
+        await this.reader.native.source.requireAvailable(externalId)
+      }
+      return externalId as SessionId
+    }
+    if (typeof params.sessionId !== 'string' || !params.sessionId) throw new BridgeError('INVALID_PARAMS', 'A session identity is required.')
+    if (this.reader.native) await this.reader.native.source.initialize(signal)
+    const ids = this.reader.native ? this.reader.native.candidates()
+      : (await this.reader.query.listSessions(signal)).map(item => item.header.id)
+    const id = ids.find(id => sessionId(this.namespace, id) === params.sessionId)
+    if (!id) throw new BridgeError('SESSION_NOT_FOUND', 'The DSH session is not visible.')
+    if (this.reader.native && !includeUnavailable) {
+      this.reader.native.source.retry(id)
+      await this.reader.native.source.requireAvailable(id)
+    }
+    return id as SessionId
+  }
+
+  private offset(cursor: unknown, page: Page<unknown> | undefined): number {
+    if (page && page.expires < Date.now()) {
+      if (this.inventory === page) this.clearInventory()
+      if (this.history === page) this.clearHistory()
+      page = undefined
+    }
+    if (typeof cursor !== 'string' || !page) {
+      throw new BridgeError('INVALID_PARAMS', 'The read cursor expired. Start a new read.')
+    }
+    const [id, offset] = cursor.split(':')
+    const index = Number(offset)
+    if (id !== page.id || !/^\d+$/.test(offset ?? '') || !Number.isSafeInteger(index) || index < 1 || index >= page.values.length) {
+      throw new BridgeError('INVALID_PARAMS', 'The read cursor is invalid.')
+    }
+    return index
+  }
+
+  private async list(params: Record<string, unknown>, signal: AbortSignal) {
+    const limit = integer(params.limit, 100, 1000)
+    let offset = 0
+    let page: Page<SessionRecord>
+    if (params.cursor != null) {
+      offset = this.offset(params.cursor, this.inventory)
+      page = this.inventory!
+    } else {
+      this.clearInventory()
+      page = { id: randomUUID(), values: await this.reader.query.listSessions(signal), expires: Date.now() + this.pageLifetimeMs }
+    }
+    const slice = page.values.slice(offset, offset + limit)
+    const records = []
+    for (const entry of slice) {
+      if (!this.reader.native || await this.reader.native.visible(entry.header.id)) records.push(entry)
+    }
+    const titles = await this.reader.query.readTitleSnapshots(records.map(item => item.header.id), signal)
+    const titleById = new Map(titles.map(title => [title.sessionId, title]))
+    const sessions = records.map(item => {
+      const title = titleById.get(item.header.id)
+      return {
+        runtime: 'dsh', sessionId: sessionId(this.namespace, item.header.id), externalSessionId: item.header.id,
+        title: title?.status === 'fulfilled' ? title.value.title?.title ?? null : null,
+        cwd: item.header.cwd ?? null, orderingTime: new Date(item.header.createdAt).toISOString(),
+        metadata: {
+          live: item.live, persisted: item.persisted, parentSession: item.header.parentSession ?? null,
+          origin: item.header.origin ?? null, readOnly: !this.reader.native?.ctx.get('agents'),
+          ...(title?.status === 'rejected' ? { titleReadFailed: true } : {}),
+          // Authoritative full reads in phase one; no persistent cursor before successful ingestion.
+          sync: { requires_timeline_sync: true, changed: true },
+        },
+      }
+    })
+    const next = offset + slice.length
+    const nextCursor = next < page.values.length ? `${page.id}:${next}` : null
+    if (nextCursor === null) {
+      if (this.inventory === page) this.clearInventory()
+    } else {
+      this.retainInventory(page)
+    }
+    return { sessions, nextCursor }
+  }
+
+  private async snapshot(params: Record<string, unknown>, signal: AbortSignal) {
+    let offset = 0
+    let page: HistoryPage
+    if (params.cursor != null) {
+      if (this.reader.native && this.history && !await this.reader.native.visible(this.history.externalId)) {
+        this.clearHistory()
+        throw new BridgeError('SESSION_NOT_FOUND', 'The session is no longer visible in DSH.')
+      }
+      offset = this.offset(params.cursor, this.history)
+      if (params.sessionId !== this.history!.platformId ||
+          (params.externalSessionId != null && params.externalSessionId !== this.history!.externalId)) {
+        throw new BridgeError('INVALID_PARAMS', 'The cursor belongs to a different session.')
+      }
+      page = this.history!
+    } else {
+      this.clearHistory()
+      const id = await this.resolve(params, signal)
+      try {
+        const log = this.reader.native ? await this.reader.native.read(id) : await this.reader.query.readSession(id)
+        signal.throwIfAborted()
+        const platformId = sessionId(this.namespace, id)
+        const all = await projectHistoryAsync(log, platformId, signal)
+        const limit = integer(params.limit, Math.max(all.length, 1), 1_000_000)
+        const values = all.slice(-limit)
+        const seq = Number(log.events.at(-1)?.seq ?? -1)
+        page = { id: randomUUID(), values, expires: Date.now() + this.pageLifetimeMs, externalId: id,
+          platformId, watermark: { seq, revision: `projection-2:${seq}` }, truncated: values.length < all.length }
+      } finally {
+        this.reader.native?.source.release(id)
+      }
+    }
+    const items: TimelineItem[] = []
+    let bytes = 0
+    for (const item of page.values.slice(offset, offset + 1000)) {
+      const size = jsonBytes(item) + 1
+      if (size > 7 * 1024 * 1024) {
+        if (this.history === page) this.clearHistory()
+        throw new BridgeError('FRAME_TOO_LARGE', 'One DSH history item exceeds the transport limit.')
+      }
+      if (bytes + size > 7 * 1024 * 1024) break
+      bytes += size
+      items.push(item)
+    }
+    const next = offset + items.length
+    const nextCursor = next < page.values.length ? `${page.id}:${next}` : null
+    if (nextCursor === null) {
+      if (this.history === page) this.clearHistory()
+    } else {
+      this.retainHistory(page)
+    }
+    return {
+      sessionId: page.platformId, externalSessionId: page.externalId, runtime: 'dsh', items,
+      complete: offset === 0 && nextCursor === null && !page.truncated,
+      snapshotComplete: !page.truncated, nextCursor, watermark: page.watermark,
+      metadata: { projectionVersion: PROJECTION_VERSION, totalItems: page.values.length, readOnly: !this.reader.native?.ctx.get('agents') },
+    }
+  }
+}
